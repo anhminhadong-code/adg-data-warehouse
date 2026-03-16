@@ -1,0 +1,26 @@
+{
+  "ValidateInfo": [],
+  "Success": false,
+  "Code": 99,
+  "SubCode": 8,
+  "UserMessage": "Mã xác nhận đã được gửi đến anhminhadong@gmail.com. Bạn vui lòng nhập chính xác mã vào ô trên.",
+  "SystemMessage": "Login Two Factor",
+  "Data": {
+    "AccessToken": {
+      "Token": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJVc2VyTmFtZSI6ImFuaG1pbmhhZG9uZ0BnbWFpbC5jb20iLCJNSVNBSUQiOiIwNjE5NzMzYi1hODYwLTQ2ZGUtOWQ5OC1kMTMzMGQ1NzYzMDIiLCJleHAiOjE3NzM2NDg4MzMsImlzcyI6Ik1JU0FKU0MifQ.BVndNpDXv7sAKWN5Y8HdovII7VYPpjZLrEbt_Z2lDRc",
+      "TokenExpired": "2026-03-16T15:13:53.938+07:00"
+    },
+    "UserName": "anhminhadong@gmail.com",
+    "UseEmail": true,
+    "UsePhoneNumber": false,
+    "UseAppAuthenticator": false,
+    "UseTrustedDevice": false,
+    "ChallengeInfo": {
+      "ChallengeId": "",
+      "ListDeviceName": []
+    }
+  },
+  "GetLastData": true,
+  "ServerTime": "2026-03-16T14:58:53.676+07:00",
+  "TraceID": "vktl2-639092699336761433"
+}
