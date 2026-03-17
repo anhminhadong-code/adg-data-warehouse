@@ -58,18 +58,27 @@ End-to-end automation: log in to MISA, download Excel exports, and load them int
 
 ## Prerequisites
 
-| Dependency | Install |
+| Dependency | Version installed |
 |---|---|
 | Python 3.9+ | — |
-| playwright | `pip install playwright` then `playwright install chromium` |
-| pandas | `pip install pandas openpyxl` |
-| psycopg2 | `pip install psycopg2-binary` |
-| python-dotenv | `pip install python-dotenv` |
+| playwright | 1.58.0 |
+| pandas | 3.0.1 |
+| openpyxl | 3.1.5 |
+| psycopg2-binary | 2.9.11 |
+| python-dotenv | 1.2.2 |
 
-Install all at once:
+### Setup (venv — recommended)
 
 ```bash
-pip install playwright pandas openpyxl psycopg2-binary python-dotenv
+python -m venv .venv
+
+# Windows
+.venv\Scripts\activate
+
+# macOS / Linux
+source .venv/bin/activate
+
+pip install -r requirements.txt
 playwright install chromium
 ```
 
@@ -95,6 +104,10 @@ DB_PORT=5432
 DB_NAME=your_database
 DB_USER=your_db_user
 DB_PASSWORD=your_db_password
+
+# Optional overrides
+RAW_DATA_DIR=C:\Projects\ADG\DWH\raw-data   # defaults to ./raw-data
+HEADLESS=false                               # set true for server/CI runs
 ```
 
 > **Gmail OTP**: use an [App Password](https://support.google.com/accounts/answer/185833), not your account password.
@@ -121,16 +134,21 @@ Defined in the `MODULES` list. Each entry maps one MISA module URL to one or mor
 }
 ```
 
-| Module path | Label | Exports to |
-|---|---|---|
-| `/app/account-object` | Account Objects | `Danh_sach_khach_hang.xlsx` (idx 0), `Danh_sach_nha_cung_cap.xlsx` (idx 1) |
-| `/app/item` | Products / Items | `Danh_sach_hang_hoa_dich_vu.xlsx` |
-| `/app/warehouse` | Warehouses / Storages | `Danh_sach_kho.xlsx` |
-| `/app/inventory` | Inventory | `stock_remaining.xlsx` |
-| `/app/voucher` | Vouchers (Stock In) | `stock_in.xlsx` |
-| `/app/invoice` | Invoices (Stock Out) | `stock_out.xlsx` |
+| Status | Full URL | Label | Selector | Exports to |
+|---|---|---|---|---|
+| Confirmed | `/app/PU/PUVendor` | Suppliers | `div.mi-excel__nav` | `Danh_sach_nha_cung_cap.xlsx` |
+| Confirmed | `/app/SA/SAInventoryItems` | Products / Items | `button.ms-button-feature` | `Danh_sach_hang_hoa_dich_vu.xlsx` |
+| Confirmed | `/app/DI/DIStock` | Warehouses | `div.mi-excel__nav` | `Danh_sach_kho.xlsx` |
+| TODO | `/app/account-object` | Customers | `div.mi-excel__nav` *(assumed)* | `Danh_sach_khach_hang.xlsx` |
+| TODO | `/app/inventory` | Stock Remaining | `div.mi-excel__nav` *(assumed)* | `stock_remaining.xlsx` |
+| TODO | `/app/voucher` | Stock In | `div.mi-excel__nav` *(assumed)* | `stock_in.xlsx` |
+| TODO | `/app/invoice` | Stock Out | `div.mi-excel__nav` *(assumed)* | `stock_out.xlsx` |
 
-> **Adjusting button index**: if MISA renders more than one "Xuất" button on a page, increment `index` until you hit the correct one.
+**Selector resolution order** (per export entry in `MODULES`):
+1. `selector` key → CSS selector clicked directly (e.g. `div.mi-excel__nav`, `button.ms-button-feature`)
+2. `button_text` key → fallback, finds `<button>` by visible text (e.g. `"Xuất"`)
+
+> **Finding remaining URLs/selectors**: open the module in Chrome DevTools → right-click the Excel export icon → *Inspect* → copy the element's class. Then copy the URL from the address bar and update the `MODULES` entry.
 
 ---
 
@@ -173,6 +191,10 @@ Defined in the `PIPELINES` list. Each entry describes one Excel → database tab
 ## Usage
 
 ```bash
+# Activate venv first
+.venv\Scripts\activate        # Windows
+source .venv/bin/activate     # macOS / Linux
+
 # Full pipeline — RPA download → stage → ingest
 python rpa_pipeline_full.py
 
@@ -194,12 +216,13 @@ Login  ──▶  OTP (if prompted)  ──▶  For each module:
                                        navigate → click "Xuất" → save file
 ```
 
-1. Launches Chromium (visible by default; set `headless=True` for server use).
+1. Launches Chromium (headless controlled by `HEADLESS` env var — default `false`).
 2. Fills username and password, clicks **Đăng nhập**.
 3. If an OTP input appears, polls the inbox via IMAP for an unread email containing a 6-digit code, fills it, and clicks **Xác nhận**.
-4. For each module, navigates to the URL and clicks each configured export button.
-5. Saves the downloaded `.xlsx` to `misa_reports/`.
-6. All `/api/` requests and responses are logged to `misa_api_capture/`.
+4. For each module in `MODULES`, navigates to the URL and waits up to `ELEMENT_TIMEOUT_MS` (15 s) for the export button to become visible — handles MISA's SPA async rendering.
+5. If the element is still not found, saves a `missing_element_<label>.png` screenshot and retries the module (up to 2 attempts) before moving on.
+6. Saves each downloaded `.xlsx` to `misa_reports/`.
+7. All `/api/` requests and responses are logged to `misa_api_capture/`.
 
 ### Phase 2 — Stage Files
 

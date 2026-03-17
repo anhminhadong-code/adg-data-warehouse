@@ -4,3 +4,4 @@ backup/
 misa_api_capture/
 logs/
 misa_reports/
+.venv/

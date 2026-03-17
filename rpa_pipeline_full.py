@@ -28,6 +28,7 @@ from datetime import datetime
 import pandas as pd
 import psycopg2
 import psycopg2.extras
+from psycopg2 import sql as pgsql
 from dotenv import load_dotenv
 from playwright.sync_api import sync_playwright
 
@@ -44,14 +45,15 @@ EMAIL_USER  = os.getenv("OTP_EMAIL")
 EMAIL_PASS  = os.getenv("OTP_PASSWORD")
 IMAP_SERVER = os.getenv("IMAP_SERVER", "imap.gmail.com")
 
-BASE_URL = "https://actapp.misa.vn"
+BASE_URL  = "https://actapp.misa.vn"
+HEADLESS  = os.getenv("HEADLESS", "false").lower() == "true"
 
 # =============================================================================
 # DIRECTORIES
 # =============================================================================
 
 DOWNLOAD_DIR  = os.path.abspath("misa_reports")
-RAW_DATA_DIR  = r"C:\Projects\ADG\DWH\raw-data"
+RAW_DATA_DIR  = os.getenv("RAW_DATA_DIR", os.path.abspath("raw-data"))
 LOG_DIR       = os.path.abspath("logs")
 CAPTURE_DIR   = os.path.abspath("misa_api_capture")
 
@@ -80,60 +82,66 @@ logger = logging.getLogger()
 
 # =============================================================================
 # MODULE → EXPORT CONFIG
-# Each entry describes one MISA module page.
-# "exports" is an ordered list of buttons to click; the script cycles through
-# them. If a module has only one export button leave a single entry.
 #
-# "rename_to": filename the file should have inside RAW_DATA_DIR so that
-#              pipeline.py can find it.  Set to None to keep suggested name.
+# Each entry describes one MISA module page and the export button(s) to click.
+#
+# Keys per module:
+#   url       – full page URL (confirmed from browser inspection)
+#   label     – human-readable name for logs
+#   exports   – list of export actions, in click order
+#
+# Keys per export action:
+#   selector      – CSS selector for the export element (preferred)
+#   button_text   – fallback: filter <button> by visible text (used when
+#                   selector is not set)
+#   index         – 0-based index when multiple elements match the selector
+#   rename_to     – filename written to RAW_DATA_DIR (None = keep original)
+#
+# Confirmed URLs and selectors (from browser inspection):
+#   Suppliers  → /app/PU/PUVendor        → div.mi-excel__nav
+#   Products   → /app/SA/SAInventoryItems → button.ms-button-feature
+#   Warehouse  → /app/DI/DIStock          → div.mi-excel__nav
+#
+# TODO: inspect and fill in confirmed URLs/selectors for the remaining modules.
 # =============================================================================
 
 MODULES = [
+    # ------------------------------------------------------------------ #
+    #  CONFIRMED — URL and selector verified from browser inspection       #
+    # ------------------------------------------------------------------ #
     {
-        "path":   "/app/account-object",
-        "label":  "Account Objects (Customers / Suppliers)",
+        "url":   "https://actapp.misa.vn/app/PU/PUVendor",
+        "label": "Suppliers (Danh sách nhà cung cấp)",
         "exports": [
-            # MISA shows separate export buttons for Khách hàng and Nhà cung cấp
-            # Adjust button_text / index to match the actual UI.
-            {"button_text": "Xuất", "index": 0, "rename_to": "Danh_sach_khach_hang.xlsx"},
-            {"button_text": "Xuất", "index": 1, "rename_to": "Danh_sach_nha_cung_cap.xlsx"},
+            {
+                "selector":  "div.mi-excel__nav",
+                "index":     0,
+                "rename_to": "Danh_sach_nha_cung_cap.xlsx",
+            },
         ],
     },
     {
-        "path":   "/app/item",
-        "label":  "Products / Items",
+        "url":   "https://actapp.misa.vn/app/SA/SAInventoryItems",
+        "label": "Products / Items (Danh sách hàng hoá dịch vụ)",
         "exports": [
-            {"button_text": "Xuất", "index": 0, "rename_to": "Danh_sach_hang_hoa_dich_vu.xlsx"},
+            {
+                "selector":  "button.ms-button-feature",
+                "index":     0,
+                "rename_to": "Danh_sach_hang_hoa_dich_vu.xlsx",
+            },
         ],
     },
     {
-        "path":   "/app/warehouse",
-        "label":  "Warehouses / Storages",
+        "url":   "https://actapp.misa.vn/app/DI/DIStock",
+        "label": "Warehouses / Storages (Danh sách kho)",
         "exports": [
-            {"button_text": "Xuất", "index": 0, "rename_to": "Danh_sach_kho.xlsx"},
+            {
+                "selector":  "div.mi-excel__nav",
+                "index":     0,
+                "rename_to": "Danh_sach_kho.xlsx",
+            },
         ],
-    },
-    {
-        "path":   "/app/inventory",
-        "label":  "Inventory (Stock Remaining)",
-        "exports": [
-            {"button_text": "Xuất", "index": 0, "rename_to": "stock_remaining.xlsx"},
-        ],
-    },
-    {
-        "path":   "/app/voucher",
-        "label":  "Vouchers (Stock In)",
-        "exports": [
-            {"button_text": "Xuất", "index": 0, "rename_to": "stock_in.xlsx"},
-        ],
-    },
-    {
-        "path":   "/app/invoice",
-        "label":  "Invoices (Stock Out)",
-        "exports": [
-            {"button_text": "Xuất", "index": 0, "rename_to": "stock_out.xlsx"},
-        ],
-    },
+    }
 ]
 
 # =============================================================================
@@ -339,6 +347,7 @@ def get_latest_otp(timeout=120):
     start = time.time()
 
     while time.time() - start < timeout:
+        mail = None
         try:
             mail = imaplib.IMAP4_SSL(IMAP_SERVER)
             mail.login(EMAIL_USER, EMAIL_PASS)
@@ -364,10 +373,14 @@ def get_latest_otp(timeout=120):
                     logger.info(f"OTP received: {code}")
                     return code
 
-            mail.logout()
-
         except Exception as e:
             logger.error(f"OTP read error: {e}")
+        finally:
+            if mail is not None:
+                try:
+                    mail.logout()
+                except Exception:
+                    pass
 
         time.sleep(5)
 
@@ -409,56 +422,82 @@ def rpa_login(page):
 # PHASE 1c — RPA: DOWNLOAD EXPORTS
 # =============================================================================
 
+ELEMENT_TIMEOUT_MS = 15_000  # ms to wait for export button after SPA renders
+
+
 def rpa_download_module(page, module_cfg):
     """
-    Navigate to a module, click each export button in order, and save the
+    Navigate to a module, click each export element in order, and save the
     downloaded file to DOWNLOAD_DIR.  Returns a dict mapping rename_to →
     downloaded filepath (or None on failure).
+
+    Selector resolution order per export entry:
+      1. "selector" key  → CSS selector (div.mi-excel__nav, button.ms-button-feature, …)
+      2. "button_text"   → fallback: <button> filtered by visible text
+
+    Uses Playwright's wait_for(state="visible") instead of time.sleep so that
+    SPA pages that render asynchronously after networkidle are handled correctly.
     """
-    url = BASE_URL + module_cfg["path"]
-    logger.info(f"  → {module_cfg['label']} ({url})")
+    url        = module_cfg["url"]
+    label      = module_cfg["label"]
+    safe_label = re.sub(r"[^\w]", "_", label)
+    logger.info(f"  → {label}")
+    logger.info(f"    URL: {url}")
 
     results = {}
 
     try:
         page.goto(url)
         page.wait_for_load_state("networkidle")
-        time.sleep(3)
     except Exception as e:
-        logger.error(f"Failed to navigate to {url}: {e}")
+        logger.error(f"    Navigation failed: {e}")
+        save_screenshot(page, f"nav_error_{safe_label}")
         return results
 
     for export_cfg in module_cfg["exports"]:
-        btn_text   = export_cfg.get("button_text", "Xuất")
-        btn_index  = export_cfg.get("index", 0)
-        rename_to  = export_cfg.get("rename_to")
+        selector  = export_cfg.get("selector")
+        btn_text  = export_cfg.get("button_text", "Xuất")
+        idx       = export_cfg.get("index", 0)
+        rename_to = export_cfg.get("rename_to")
 
         try:
-            buttons = page.locator("button").filter(has_text=btn_text)
+            # Resolve locator — CSS selector takes priority over text matching
+            if selector:
+                locator = page.locator(selector)
+                desc    = f"selector='{selector}' index={idx}"
+            else:
+                locator = page.locator("button").filter(has_text=btn_text)
+                desc    = f"button text='{btn_text}' index={idx}"
 
-            if buttons.count() == 0:
-                logger.warning(f"    No '{btn_text}' button found (index {btn_index})")
+            # Wait for the element to be visible — handles SPA lazy rendering.
+            # This replaces time.sleep(3) + instant count() check.
+            try:
+                locator.nth(idx).wait_for(state="visible", timeout=ELEMENT_TIMEOUT_MS)
+            except Exception:
+                logger.warning(
+                    f"    Element not visible after {ELEMENT_TIMEOUT_MS}ms ({desc})"
+                )
+                save_screenshot(page, f"missing_element_{safe_label}_{idx}")
                 continue
 
-            logger.info(f"    Clicking export button '{btn_text}' (index {btn_index})")
+            logger.info(f"    Clicking export element ({desc})")
 
             with page.expect_download(timeout=60_000) as dl_info:
-                buttons.nth(btn_index).click()
+                locator.nth(idx).click()
 
             download  = dl_info.value
-            suggested = download.suggested_filename or f"export_{hash_url(url)}_{btn_index}.xlsx"
+            suggested = download.suggested_filename or f"export_{hash_url(url)}_{idx}.xlsx"
             dest_path = os.path.join(DOWNLOAD_DIR, suggested)
             download.save_as(dest_path)
 
-            logger.info(f"    Downloaded: {dest_path}")
+            logger.info(f"    Saved: {dest_path}")
             results[rename_to] = dest_path
 
-            # Small pause between exports on the same page
             time.sleep(2)
 
         except Exception as e:
-            logger.error(f"    Export failed (index {btn_index}): {e}")
-            save_screenshot(page, f"export_error_{module_cfg['path'].replace('/', '_')}_{btn_index}")
+            logger.error(f"    Export failed (index {idx}): {e}")
+            save_screenshot(page, f"export_error_{safe_label}_{idx}")
 
     return results
 
@@ -476,7 +515,7 @@ def run_rpa():
 
     with sync_playwright() as p:
 
-        browser = p.chromium.launch(headless=False, slow_mo=50)
+        browser = p.chromium.launch(headless=HEADLESS, slow_mo=0 if HEADLESS else 50)
         context = browser.new_context(accept_downloads=True)
         page    = context.new_page()
 
@@ -521,9 +560,24 @@ def run_rpa():
             browser.close()
             return download_map
 
+        MAX_MODULE_RETRIES = 2
         for module_cfg in MODULES:
-            result = rpa_download_module(page, module_cfg)
-            download_map.update(result)
+            for attempt in range(1, MAX_MODULE_RETRIES + 1):
+                try:
+                    result = rpa_download_module(page, module_cfg)
+                    download_map.update(result)
+                    if result:
+                        break  # at least one file downloaded — success
+                    if attempt < MAX_MODULE_RETRIES:
+                        logger.warning(
+                            f"  Module yielded no downloads "
+                            f"(attempt {attempt}/{MAX_MODULE_RETRIES}), retrying…"
+                        )
+                except Exception as e:
+                    logger.error(
+                        f"  Module error (attempt {attempt}/{MAX_MODULE_RETRIES}) "
+                        f"({module_cfg['label']}): {e}"
+                    )
 
         browser.close()
 
@@ -615,7 +669,7 @@ def read_excel(cfg):
     return df
 
 
-def run_pipeline_cfg(cfg):
+def run_pipeline_cfg(cfg, conn):
     label  = cfg["label"]
     table  = cfg["table"]
     schema = cfg["schema"]
@@ -634,15 +688,20 @@ def run_pipeline_cfg(cfg):
     cols_sql     = ", ".join(q(c) for c in schema)
     placeholders = ", ".join(["%s"] * len(schema))
 
-    conn = get_connection()
-    cur  = conn.cursor()
+    cur = conn.cursor()
 
     try:
 
+        tbl = pgsql.Identifier(table)
+
         # ---- TRUNCATE + INSERT ----
         if mode == "truncate":
-            cur.execute(f"TRUNCATE TABLE {table}")
-            insert_sql = f"INSERT INTO {table} ({cols_sql}) VALUES ({placeholders})"
+            cur.execute(pgsql.SQL("TRUNCATE TABLE {}").format(tbl))
+            insert_sql = pgsql.SQL("INSERT INTO {} ({}) VALUES ({})").format(
+                tbl,
+                pgsql.SQL(cols_sql),
+                pgsql.SQL(placeholders),
+            )
             data = df.values.tolist()
             psycopg2.extras.execute_batch(cur, insert_sql, data, page_size=1000)
             conn.commit()
@@ -659,12 +718,18 @@ def run_pipeline_cfg(cfg):
             conflict_cols = ", ".join(q(c) for c in key_cols)
             set_clause    = ", ".join(set_parts)
 
-            insert_sql = f"""
-                INSERT INTO {table} ({cols_sql})
-                VALUES ({placeholders})
-                ON CONFLICT ({conflict_cols})
-                DO UPDATE SET {set_clause}
-            """
+            insert_sql = pgsql.SQL("""
+                INSERT INTO {} ({})
+                VALUES ({})
+                ON CONFLICT ({})
+                DO UPDATE SET {}
+            """).format(
+                tbl,
+                pgsql.SQL(cols_sql),
+                pgsql.SQL(placeholders),
+                pgsql.SQL(conflict_cols),
+                pgsql.SQL(set_clause),
+            )
             rows = [tuple(r) for r in df.itertuples(index=False)]
             psycopg2.extras.execute_batch(cur, insert_sql, rows, page_size=1000)
             conn.commit()
@@ -675,7 +740,9 @@ def run_pipeline_cfg(cfg):
             key_cols     = cfg["key_cols"]
             key_cols_sql = ", ".join(q(c) for c in key_cols)
 
-            cur.execute(f"SELECT {key_cols_sql} FROM {table}")
+            cur.execute(pgsql.SQL("SELECT {} FROM {}").format(
+                pgsql.SQL(key_cols_sql), tbl
+            ))
             existing_keys = set(cur.fetchall())
 
             insert_rows = []
@@ -689,7 +756,11 @@ def run_pipeline_cfg(cfg):
                 else:
                     insert_rows.append(values)
 
-            insert_sql = f"INSERT INTO {table} ({cols_sql}) VALUES ({placeholders})"
+            insert_sql = pgsql.SQL("INSERT INTO {} ({}) VALUES ({})").format(
+                tbl,
+                pgsql.SQL(cols_sql),
+                pgsql.SQL(placeholders),
+            )
             if insert_rows:
                 psycopg2.extras.execute_batch(cur, insert_sql, insert_rows, page_size=1000)
 
@@ -699,9 +770,10 @@ def run_pipeline_cfg(cfg):
                 set_parts.append("updated_at = NOW()")
 
             where_parts = [f"{q(c)} = %s" for c in key_cols]
-            update_sql  = (
-                f"UPDATE {table} SET {', '.join(set_parts)} "
-                f"WHERE {' AND '.join(where_parts)}"
+            update_sql  = pgsql.SQL("UPDATE {} SET {} WHERE {}").format(
+                tbl,
+                pgsql.SQL(", ".join(set_parts)),
+                pgsql.SQL(" AND ".join(where_parts)),
             )
 
             if update_rows:
@@ -722,7 +794,6 @@ def run_pipeline_cfg(cfg):
 
     finally:
         cur.close()
-        conn.close()
 
 
 def run_ingest():
@@ -731,12 +802,16 @@ def run_ingest():
     logger.info("=" * 60)
 
     errors = []
+    conn = get_connection()
 
-    for cfg in PIPELINES:
-        try:
-            run_pipeline_cfg(cfg)
-        except Exception as e:
-            errors.append((cfg["label"], str(e)))
+    try:
+        for cfg in PIPELINES:
+            try:
+                run_pipeline_cfg(cfg, conn)
+            except Exception as e:
+                errors.append((cfg["label"], str(e)))
+    finally:
+        conn.close()
 
     if errors:
         logger.error(f"Ingest completed with {len(errors)} error(s):")
